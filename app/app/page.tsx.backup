@@ -1,0 +1,1690 @@
+
+'use client'
+
+import { useSession, signOut } from 'next-auth/react'
+import { useEffect, useState, useCallback, useMemo } from 'react'
+import { useRouter } from 'next/navigation'
+import Link from 'next/link'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
+import { Dialog, DialogContent, DialogTrigger } from '@/components/ui/dialog'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { Switch } from '@/components/ui/switch'
+import { RoomForm } from '@/components/rooms/room-form'
+import { RoomCard } from '@/components/rooms/room-card'
+import { AdminNav, AdminQuickActions } from '@/components/rbac/admin-nav'
+import { HomeBottomToolbar } from '@/components/home-bottom-toolbar'
+import { AdminQuickActionsCollapsible } from '@/components/admin-quick-actions-collapsible'
+import ActivityFeed from '@/components/audit/activity-feed'
+import { Search, Scan, Plus, Settings, Home as HomeIcon, Truck, Sparkles, Package, Zap, X, BarChart3, Camera, Clock, ChefHat, Filter, SortAsc, History, Loader2, ArrowRight, Command, Shield, Download, DollarSign, FileText, LogOut, MoreVertical, Edit, Cog, Eye, Trash2, RefreshCw } from 'lucide-react'
+import { toast } from 'react-hot-toast'
+
+interface Room {
+  id: string
+  name: string
+  description: string | null
+  color: string
+  userId: string
+  isActive: boolean
+  createdAt: Date
+  updatedAt: Date
+  _count?: {
+    items: number
+    racks: number
+  }
+}
+
+// Helper function to truncate text
+const truncateText = (text: string, maxLength: number = 60): { truncated: string; isTruncated: boolean } => {
+  if (!text || text.length <= maxLength) {
+    return { truncated: text || '', isTruncated: false }
+  }
+  return { 
+    truncated: text.substring(0, maxLength).trim() + '...', 
+    isTruncated: true 
+  }
+}
+
+// Helper function to get room activity status (badge only, no card styling)
+const getRoomActivityStyle = (itemCount: number, rackCount = 0) => {
+  if (itemCount === 0) {
+    // If no items but has racks - room is set up and ready
+    if (rackCount > 0) {
+      return {
+        level: 'ready',
+        badgeStyle: 'bg-blue-50 text-blue-700 border-blue-200',
+        badgeText: 'Ready',
+        statusIcon: 'bg-blue-400',
+        textStyle: 'text-blue-600',
+        countStyle: 'text-blue-500 font-normal'
+      }
+    }
+    // No items and no racks - truly empty
+    return {
+      level: 'empty',
+      badgeStyle: 'bg-gray-100 text-gray-500 border-gray-200',
+      badgeText: 'Empty',
+      statusIcon: 'bg-gray-300',
+      textStyle: 'text-gray-500',
+      countStyle: 'text-gray-400 font-normal'
+    }
+  } else if (itemCount <= 3) {
+    return {
+      level: 'low',
+      badgeStyle: 'bg-amber-50 text-amber-700 border-amber-200',
+      badgeText: 'Light Use',
+      statusIcon: 'bg-amber-400 animate-pulse',
+      textStyle: 'text-gray-600',
+      countStyle: 'text-amber-600 font-medium'
+    }
+  } else {
+    return {
+      level: 'active',
+      badgeStyle: 'bg-green-100 text-green-800 border-green-300',
+      badgeText: 'Active',
+      statusIcon: 'bg-green-500 animate-pulse shadow-sm',
+      textStyle: 'text-gray-700',
+      countStyle: 'text-green-700 font-bold'
+    }
+  }
+}
+
+// Types for Life Event Mode
+type LifeEventMode = 'moving' | 'spring-cleaning' | 'reorganizing' | null
+
+export default function Home() {
+  const { data: session, status } = useSession() || {}
+  const router = useRouter()
+  const [rooms, setRooms] = useState<Room[]>([])
+  const [loading, setLoading] = useState(true)
+  const [isRoomFormOpen, setIsRoomFormOpen] = useState(false)
+  const [isSubmittingRoom, setIsSubmittingRoom] = useState(false)
+  const [editingRoom, setEditingRoom] = useState<Room | null>(null)
+  
+
+  
+  // Quick Access overlay state
+  const [isQuickAccessOpen, setIsQuickAccessOpen] = useState(false)
+  
+  // Universal Search state
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState({
+    rooms: [] as any[],
+    actions: [] as any[],
+    items: [] as any[],
+    recent: [] as any[]
+  })
+  const [isRefreshing, setIsRefreshing] = useState(false)
+  const [recentRooms, setRecentRooms] = useState<any[]>([])
+  const [searchHistory, setSearchHistory] = useState<string[]>([])
+  const [selectedResultIndex, setSelectedResultIndex] = useState(-1)
+  const [searchSortBy, setSearchSortBy] = useState<'relevance' | 'recency' | 'alphabetical'>('relevance')
+  const [searchFilters, setSearchFilters] = useState({
+    roomStatus: 'all', // 'all', 'active', 'ready', 'empty', 'low'
+    itemCategory: 'all',
+    dateRange: 'all' // 'all', 'recent', 'week', 'month'
+  })
+  const [isLoadingSearch, setIsLoadingSearch] = useState(false)
+  const [allItems, setAllItems] = useState<any[]>([])
+  
+  // Load recent rooms and search history from localStorage
+  useEffect(() => {
+    try {
+      const storedRooms = localStorage.getItem('garagegrid_recent_rooms')
+      if (storedRooms) {
+        const parsed = JSON.parse(storedRooms)
+        setRecentRooms(Array.isArray(parsed) ? parsed : [])
+      }
+      
+      const storedHistory = localStorage.getItem('garagegrid_search_history')
+      if (storedHistory) {
+        const parsed = JSON.parse(storedHistory)
+        setSearchHistory(Array.isArray(parsed) ? parsed : [])
+      }
+    } catch (error) {
+      console.error('Error loading data from localStorage:', error)
+    }
+  }, [])
+
+  // Track room visits
+  const trackRoomVisit = useCallback((room: any) => {
+    try {
+      const updatedRecent = [
+        room,
+        ...recentRooms.filter(r => r.id !== room.id)
+      ].slice(0, 5) // Keep only 5 recent rooms
+      
+      setRecentRooms(updatedRecent)
+      localStorage.setItem('garagegrid_recent_rooms', JSON.stringify(updatedRecent))
+    } catch (error) {
+      console.error('Error tracking room visit:', error)
+    }
+  }, [recentRooms])
+
+  // Track search history
+  const addToSearchHistory = useCallback((query: string) => {
+    if (!query.trim() || query.length < 2) return
+    
+    try {
+      const updatedHistory = [
+        query,
+        ...searchHistory.filter(h => h.toLowerCase() !== query.toLowerCase())
+      ].slice(0, 10) // Keep only 10 recent searches
+      
+      setSearchHistory(updatedHistory)
+      localStorage.setItem('garagegrid_search_history', JSON.stringify(updatedHistory))
+    } catch (error) {
+      console.error('Error tracking search history:', error)
+    }
+  }, [searchHistory])
+
+  // Fetch all items for search
+  const fetchAllItems = useCallback(async (bustCache = false) => {
+    if (!session) return
+    
+    try {
+      // Add cache busting when needed
+      const url = bustCache 
+        ? `/api/items/search?_t=${Date.now()}` 
+        : '/api/items/search'
+      
+      const response = await fetch(url, {
+        cache: bustCache ? 'no-store' : 'default',
+        headers: bustCache ? {
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Pragma': 'no-cache'
+        } : {}
+      })
+      
+      if (response.ok) {
+        const data = await response.json()
+        setAllItems(Array.isArray(data) ? data : [])
+      }
+    } catch (error) {
+      console.error('Error fetching items for search:', error)
+    }
+  }, [session])
+
+  // Load all items when component mounts
+  useEffect(() => {
+    if (session && rooms.length > 0) {
+      fetchAllItems()
+    }
+  }, [session, rooms.length, fetchAllItems])
+
+  // Keyboard navigation
+  const handleKeyDown = useCallback((e: KeyboardEvent) => {
+    if (!isQuickAccessOpen) return
+
+    const totalResults = searchResults.rooms.length + searchResults.actions.length + searchResults.items.length
+
+    switch (e.key) {
+      case 'ArrowDown':
+        e.preventDefault()
+        setSelectedResultIndex(prev => 
+          prev < totalResults - 1 ? prev + 1 : -1
+        )
+        break
+      
+      case 'ArrowUp':
+        e.preventDefault()
+        setSelectedResultIndex(prev => 
+          prev > -1 ? prev - 1 : totalResults - 1
+        )
+        break
+      
+      case 'Enter':
+        e.preventDefault()
+        if (selectedResultIndex >= 0) {
+          handleSelectResult()
+        }
+        break
+      
+      case 'Escape':
+        e.preventDefault()
+        setIsQuickAccessOpen(false)
+        setSearchQuery('')
+        setSelectedResultIndex(-1)
+        break
+    }
+  }, [isQuickAccessOpen, selectedResultIndex, searchResults])
+
+  // Add keyboard event listeners
+  useEffect(() => {
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [handleKeyDown])
+
+  // Handle selecting a result via keyboard
+  const handleSelectResult = () => {
+    let currentIndex = 0
+    
+    // Check rooms first
+    if (selectedResultIndex < searchResults.rooms.length) {
+      const room = searchResults.rooms[selectedResultIndex]
+      handleSearchNavigation(room, 'room')
+      return
+    }
+    currentIndex += searchResults.rooms.length
+
+    // Then actions
+    if (selectedResultIndex < currentIndex + searchResults.actions.length) {
+      const action = searchResults.actions[selectedResultIndex - currentIndex]
+      handleSearchNavigation(action, 'action')
+      return
+    }
+    currentIndex += searchResults.actions.length
+
+    // Then items
+    if (selectedResultIndex < currentIndex + searchResults.items.length) {
+      const item = searchResults.items[selectedResultIndex - currentIndex]
+      handleSearchNavigation(item, 'item')
+      return
+    }
+  }
+
+  // Define quick actions for search
+  const quickActions = useMemo(() => [
+    {
+      id: 'receipt-scanner',
+      name: 'Receipt Scanner',
+      description: 'Scan and add items from receipts',
+      icon: Scan,
+      color: 'green',
+      path: '/receipt-scanner',
+      keywords: ['receipt', 'scan', 'add', 'items', 'grocery', 'shopping']
+    },
+    {
+      id: 'expiration-tracker',
+      name: 'Expiration Tracker',
+      description: 'Track item expiration dates',
+      icon: Clock,
+      color: 'red',
+      path: '/expiration-dashboard',
+      keywords: ['expiration', 'expire', 'dates', 'tracker', 'alerts']
+    },
+    {
+      id: 'recipe-generator',
+      name: 'Recipe Generator',
+      description: 'Generate recipes from your items',
+      icon: ChefHat,
+      color: 'orange',
+      path: '/recipe-generator',
+      keywords: ['recipe', 'cook', 'meal', 'food', 'ingredients']
+    },
+    {
+      id: 'analytics',
+      name: 'Analytics',
+      description: 'View inventory analytics',
+      icon: BarChart3,
+      color: 'blue',
+      path: '/analytics',
+      keywords: ['analytics', 'stats', 'reports', 'data', 'insights']
+    },
+    {
+      id: 'photo-gallery',
+      name: 'Photo Gallery',
+      description: 'Browse item photos',
+      icon: Camera,
+      color: 'gray',
+      path: '/gallery',
+      keywords: ['photo', 'gallery', 'images', 'pictures']
+    },
+    {
+      id: 'all-items',
+      name: 'All Items',
+      description: 'Browse all your items',
+      icon: Package,
+      color: 'amber',
+      path: '/items',
+      keywords: ['items', 'all', 'browse', 'inventory', 'list']
+    },
+    {
+      id: 'create-room',
+      name: 'Create New Room',
+      description: 'Add a new storage room',
+      icon: Plus,
+      color: 'blue',
+      action: () => setIsRoomFormOpen(true),
+      keywords: ['create', 'add', 'new', 'room', 'storage', 'area']
+    },
+    {
+      id: 'export-data',
+      name: 'Export Data',
+      description: 'Export inventory to CSV/Excel',
+      icon: Download,
+      color: 'green',
+      path: '/export',
+      keywords: ['export', 'download', 'csv', 'excel', 'backup', 'data']
+    },
+    {
+      id: 'insurance-report',
+      name: 'Insurance Report',
+      description: 'Generate insurance value report',
+      icon: Shield,
+      color: 'purple',
+      path: '/insurance-report',
+      keywords: ['insurance', 'value', 'report', 'coverage', 'homeowner', 'protection']
+    },
+    {
+      id: 'donation-candidates',
+      name: 'Donation Candidates',
+      description: 'Find items for donation',
+      icon: FileText,
+      color: 'emerald',
+      action: () => handleDonationExport(),
+      keywords: ['donation', 'candidates', 'unused', 'charity', 'give', 'declutter']
+    }
+  ], [])
+
+  // Fuzzy search function
+  const fuzzyMatch = (text: string, query: string): boolean => {
+    if (!query) return true
+    const textLower = text.toLowerCase()
+    const queryLower = query.toLowerCase()
+    
+    // Direct substring match
+    if (textLower.includes(queryLower)) return true
+    
+    // Fuzzy character matching
+    let queryIndex = 0
+    for (let i = 0; i < textLower.length && queryIndex < queryLower.length; i++) {
+      if (textLower[i] === queryLower[queryIndex]) {
+        queryIndex++
+      }
+    }
+    return queryIndex === queryLower.length
+  }
+
+  // Advanced search with debouncing
+  useEffect(() => {
+    const searchTimeout = setTimeout(() => {
+      if (!searchQuery.trim()) {
+        setSearchResults({
+          rooms: [],
+          actions: [],
+          items: [],
+          recent: recentRooms.slice(0, 3)
+        })
+        setSelectedResultIndex(-1)
+        return
+      }
+
+      setIsLoadingSearch(true)
+      const query = searchQuery.toLowerCase()
+      
+      // Filter rooms with enhanced matching
+      let filteredRooms = rooms.filter(room => {
+        const nameMatch = fuzzyMatch(room.name, query)
+        const descMatch = fuzzyMatch(room.description || '', query)
+        return nameMatch || descMatch
+      })
+
+      // Apply room filters
+      if (searchFilters.roomStatus !== 'all') {
+        filteredRooms = filteredRooms.filter(room => {
+          const itemCount = room._count?.items || 0
+          const rackCount = room._count?.racks || 0
+          const activityLevel = getRoomActivityStyle(itemCount, rackCount).level
+          return activityLevel === searchFilters.roomStatus
+        })
+      }
+
+      // Filter actions
+      const filteredActions = quickActions.filter((action: any) => 
+        fuzzyMatch(action.name, query) ||
+        fuzzyMatch(action.description, query) ||
+        action.keywords.some((keyword: string) => fuzzyMatch(keyword, query))
+      )
+
+      // Filter items
+      const filteredItems = allItems.filter(item => 
+        fuzzyMatch(item.name, query) ||
+        fuzzyMatch(item.description || '', query) ||
+        fuzzyMatch(item.category || '', query) ||
+        fuzzyMatch(item.brand || '', query)
+      )
+
+      // Apply sorting
+      const sortResults = (items: any[], type: 'rooms' | 'actions' | 'items') => {
+        if (searchSortBy === 'alphabetical') {
+          return items.sort((a, b) => a.name.localeCompare(b.name))
+        } else if (searchSortBy === 'recency' && type === 'rooms') {
+          return items.sort((a, b) => {
+            const aRecent = recentRooms.findIndex(r => r.id === a.id)
+            const bRecent = recentRooms.findIndex(r => r.id === b.id)
+            if (aRecent === -1 && bRecent === -1) return 0
+            if (aRecent === -1) return 1
+            if (bRecent === -1) return -1
+            return aRecent - bRecent
+          })
+        }
+        return items // relevance (default order)
+      }
+
+      setSearchResults({
+        rooms: sortResults(filteredRooms, 'rooms').slice(0, 5),
+        actions: sortResults(filteredActions, 'actions').slice(0, 3),
+        items: sortResults(filteredItems, 'items').slice(0, 8),
+        recent: []
+      })
+      
+      setSelectedResultIndex(-1)
+      setIsLoadingSearch(false)
+    }, 150) // Debounce search
+
+    return () => {
+      clearTimeout(searchTimeout)
+      setIsLoadingSearch(false)
+    }
+  }, [searchQuery, rooms, quickActions, recentRooms, allItems, searchSortBy, searchFilters])
+
+  // Handle search navigation
+  const handleSearchNavigation = (item: any, type: 'room' | 'action' | 'item') => {
+    // Add to search history if there was a query
+    if (searchQuery.trim()) {
+      addToSearchHistory(searchQuery.trim())
+    }
+
+    if (type === 'room') {
+      trackRoomVisit(item)
+      router.push(`/rooms/${item.id}`)
+    } else if (type === 'action') {
+      if (item.action) {
+        item.action()
+      } else {
+        router.push(item.path)
+      }
+    } else if (type === 'item') {
+      // Navigate to item's room and highlight the item
+      router.push(`/rooms/${item.roomId}?highlight=${item.id}`)
+    }
+    
+    setIsQuickAccessOpen(false)
+    setSearchQuery('')
+    setSelectedResultIndex(-1)
+  }
+
+  // Manual refresh will be defined after fetchRooms
+
+  // Global keyboard shortcuts will be moved after handleForceRefresh
+
+
+
+
+
+  const fetchRooms = useCallback(async (bustCache = false) => {
+    try {
+      // Add cache busting when needed
+      const url = bustCache 
+        ? `/api/rooms?_t=${Date.now()}` 
+        : '/api/rooms'
+      
+      const response = await fetch(url, {
+        // Force reload from server
+        cache: bustCache ? 'no-store' : 'default',
+        headers: bustCache ? {
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Pragma': 'no-cache'
+        } : {}
+      })
+      
+      if (response.ok) {
+        const data = await response.json()
+        
+        // Ensure data is an array before setting state
+        if (Array.isArray(data)) {
+          setRooms(data)
+          
+          // If cache busting, also refresh search items
+          if (bustCache) {
+            await fetchAllItems()
+          }
+        } else {
+          console.error('Invalid data format received:', data)
+          setRooms([])
+        }
+      } else {
+        console.error('Failed to fetch rooms:', response.status, response.statusText)
+        setRooms([])
+      }
+    } catch (error) {
+      console.error('Error fetching rooms:', error)
+      setRooms([])
+    } finally {
+      setLoading(false)
+    }
+  }, [fetchAllItems])
+
+  // Manual refresh function for force updating data
+  const handleForceRefresh = useCallback(async () => {
+    setIsRefreshing(true)
+    console.log("🔄 Manual force refresh triggered...")
+    
+    try {
+      // Force refresh all data with cache busting
+      await Promise.all([
+        fetchRooms(true),
+        fetchAllItems(true)
+      ])
+      
+      toast.success('✅ Data refreshed successfully!')
+      console.log("✅ Manual refresh completed")
+    } catch (error) {
+      console.error('Error during manual refresh:', error)
+      toast.error('Failed to refresh data')
+    } finally {
+      setIsRefreshing(false)
+    }
+  }, [fetchRooms, fetchAllItems])
+
+  // Global keyboard shortcuts
+  useEffect(() => {
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      // Cmd+K or Ctrl+K to open search
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault()
+        setIsQuickAccessOpen(true)
+        setSearchQuery('')
+        setSelectedResultIndex(-1)
+      }
+      // Cmd+R or Ctrl+R to force refresh (prevent default page reload)
+      if ((e.metaKey || e.ctrlKey) && e.key === 'r' && !e.shiftKey) {
+        e.preventDefault()
+        handleForceRefresh()
+      }
+    }
+
+    document.addEventListener('keydown', handleGlobalKeyDown)
+    return () => document.removeEventListener('keydown', handleGlobalKeyDown)
+  }, [handleForceRefresh])
+
+  // Check for stale data when page becomes visible (e.g. browser back button)
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (!document.hidden && session) {
+        // Check if data is stale when page becomes visible
+        const isStale = localStorage.getItem('garagegrid_room_data_stale') === 'true'
+        if (isStale) {
+          console.log('🔄 Page visible with stale data - forcing refresh')
+          localStorage.removeItem('garagegrid_room_data_stale')
+          localStorage.removeItem('garagegrid_stale_room_id')
+          fetchRooms(true) // Force refresh with cache busting
+        }
+      }
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    window.addEventListener('focus', handleVisibilityChange)
+    
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+      window.removeEventListener('focus', handleVisibilityChange)
+    }
+  }, [session, fetchRooms])
+
+  useEffect(() => {
+    let isMounted = true
+    
+    const loadRooms = async () => {
+      if (!isMounted || !session) return
+      
+      try {
+        // Check for stale data flag or URL parameter
+        const urlParams = new URLSearchParams(window.location.search)
+        const shouldRefresh = urlParams.has('refresh') || 
+          localStorage.getItem('garagegrid_room_data_stale') === 'true'
+        
+        if (shouldRefresh) {
+          console.log('🔄 Detected stale room data - forcing refresh from URL/localStorage')
+          
+          // Clear the stale data flags
+          localStorage.removeItem('garagegrid_room_data_stale')
+          localStorage.removeItem('garagegrid_stale_room_id')
+          
+          // Clear URL parameter
+          if (urlParams.has('refresh')) {
+            window.history.replaceState({}, '', window.location.pathname)
+          }
+          
+          // Force refresh with cache busting
+          await fetchRooms(true)
+        } else {
+          // Normal load
+          await fetchRooms()
+        }
+      } catch (error) {
+        if (isMounted) {
+          console.error('Error loading rooms:', error)
+          setLoading(false) // Ensure loading is set to false even on error
+        }
+      }
+    }
+    
+    if (session) {
+      loadRooms()
+    } else {
+      // If no session, make sure loading is false
+      setLoading(false)
+    }
+    
+    return () => {
+      isMounted = false
+    }
+  }, [session, fetchRooms])
+
+
+
+  const handleVoiceCommand = () => {
+    // Placeholder for voice command functionality
+    console.log('Voice command activated');
+  }
+
+  const handleAddItem = () => {
+    router.push('/items')
+  }
+
+  const handleCreateRoom = async (data: { name: string; description: string; color: string }) => {
+    setIsSubmittingRoom(true)
+    
+    try {
+      const response = await fetch('/api/rooms', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(data)
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        
+        // Handle authentication errors specially
+        if (response.status === 401) {
+          toast.error(errorData.error || 'Authentication required. Please sign in again.')
+          // Redirect to sign in page
+          setTimeout(() => {
+            router.push('/auth/signin')
+          }, 2000)
+          return
+        }
+        
+        throw new Error(errorData.error || errorData.message || `Failed to create room: ${response.status}`)
+      }
+
+      const newRoom = await response.json()
+      
+      // Validate the response
+      if (!newRoom || !newRoom.id) {
+        throw new Error('Invalid response from server')
+      }
+
+      setRooms(prev => [newRoom, ...prev])
+      setIsRoomFormOpen(false)
+      toast.success('Room created successfully!')
+      
+      // Navigate directly to the new room
+      router.push(`/rooms/${newRoom.id}`)
+      
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred'
+      toast.error(errorMessage)
+      console.error('Error creating room:', error)
+    } finally {
+      setIsSubmittingRoom(false)
+    }
+  }
+
+  const handleCancelRoomForm = () => {
+    setIsRoomFormOpen(false)
+    setEditingRoom(null)
+  }
+
+  const handleEditRoom = (room: Room) => {
+    setEditingRoom(room)
+    setIsRoomFormOpen(true)
+  }
+
+  const handleUpdateRoom = async (data: { name: string; description: string; color: string }) => {
+    if (!editingRoom) return
+
+    setIsSubmittingRoom(true)
+    
+    try {
+      const response = await fetch(`/api/rooms/${editingRoom.id}`, {
+        method: 'PUT',
+        headers: { 
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(data)
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.error || errorData.message || `Failed to update room: ${response.status}`)
+      }
+
+      const updatedRoom = await response.json()
+      
+      // Update the rooms list
+      setRooms(prev => prev.map(room => room.id === updatedRoom.id ? updatedRoom : room))
+      setIsRoomFormOpen(false)
+      setEditingRoom(null)
+      toast.success('Room updated successfully!')
+      
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred'
+      toast.error(errorMessage)
+      console.error('Error updating room:', error)
+    } finally {
+      setIsSubmittingRoom(false)
+    }
+  }
+
+  // Handle room deletion with safety checks
+  const handleRoomDelete = async (room: any) => {
+    try {
+      console.log("🗑️ DASHBOARD DELETE ROOM CLICKED!", { roomId: room.id, roomName: room.name })
+      
+      // Perform safety analysis first
+      const response = await fetch(`/api/rooms/${room.id}/safety-analysis`)
+      
+      if (!response.ok) {
+        toast.error('Failed to analyze room for deletion')
+        return
+      }
+      
+      const analysis = await response.json()
+      console.log("🔍 Room safety analysis:", analysis)
+      
+      if (analysis.safetyAnalysis.canDelete) {
+        // Room is empty - proceed with confirmation
+        const confirmDelete = confirm(`Are you sure you want to delete "${room.name}"?\n\nThis room is empty and safe to delete. This action can be undone for 30 days.\n\nClick OK to continue.`)
+        
+        if (confirmDelete) {
+          console.log("🔄 Attempting to delete room:", room.id)
+          const deleteResponse = await fetch(`/api/rooms/${room.id}`, {
+            method: 'DELETE'
+          })
+          
+          if (deleteResponse.ok) {
+            toast.success(`✅ Room "${room.name}" deleted successfully. Undo available for 30 days.`)
+            
+            // Force refresh with cache busting after deletion
+            console.log("🔄 Force refreshing data after room deletion...")
+            await fetchRooms(true) // Cache bust = true
+            
+            // Small delay to ensure UI updates
+            await new Promise(resolve => setTimeout(resolve, 100))
+            
+            // If user might be viewing the room detail page, redirect them
+            if (window.location.pathname.includes(`/rooms/${room.id}`)) {
+              window.location.href = '/'
+            }
+          } else {
+            const errorData = await deleteResponse.json()
+            toast.error(errorData.error || 'Failed to delete room')
+          }
+        }
+      } else {
+        // Room is not empty - show detailed warning
+        const blockers = analysis.safetyAnalysis.blockers.join(', ')
+        toast.error(`Cannot delete "${room.name}" - it contains: ${blockers}`)
+        
+        alert(`❌ Cannot Delete Room "${room.name}"\n\nThis room contains:\n${analysis.safetyAnalysis.blockers.map((b: string) => `• ${b}`).join('\n')}\n\n💡 Next steps: First move or remove all items, then try deleting the room again.`)
+      }
+    } catch (error) {
+      console.error('Error deleting room:', error)
+      toast.error('Failed to delete room')
+    }
+  }
+
+  // Export handler functions
+  const handleExportData = async () => {
+    try {
+      const response = await fetch('/api/export?type=all&format=csv')
+      
+      if (response.headers.get('content-type')?.includes('text/csv')) {
+        const blob = await response.blob()
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `garagegrid-inventory-${new Date().toISOString().split('T')[0]}.csv`
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+        toast.success('Inventory exported successfully!')
+      } else {
+        const data = await response.json()
+        toast.success(`Found ${data.count} items for export`)
+      }
+    } catch (error) {
+      console.error('Export error:', error)
+      toast.error('Failed to export inventory')
+    }
+  }
+
+  const handleDonationExport = async () => {
+    try {
+      const response = await fetch('/api/export?type=donation&format=csv&donationDays=90')
+      
+      if (response.headers.get('content-type')?.includes('text/csv')) {
+        const blob = await response.blob()
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `garagegrid-donation-candidates-${new Date().toISOString().split('T')[0]}.csv`
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+        toast.success('Donation candidates exported successfully!')
+      } else {
+        const data = await response.json()
+        if (data.count === 0) {
+          toast.success('No donation candidates found (items unused for 90+ days)')
+        } else {
+          toast.success(`Found ${data.count} donation candidates`)
+        }
+      }
+    } catch (error) {
+      console.error('Donation export error:', error)
+      toast.error('Failed to export donation candidates')
+    }
+  }
+
+  if (status === 'loading') {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-100">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+      </div>
+    )
+  }
+
+  if (!session) {
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center p-8 bg-gradient-to-br from-blue-50 to-indigo-100">
+        <Card className="w-full max-w-md">
+          <CardHeader className="text-center">
+            <div className="flex flex-col items-center space-y-4">
+              <div className="w-12 h-12 bg-white rounded-xl shadow-lg flex items-center justify-center">
+                <img 
+                  src="/garagegrid-logo.png" 
+                  alt="GarageGrid Logo" 
+                  className="w-8 h-8 object-contain"
+                />
+              </div>
+              <CardTitle className="text-2xl font-bold text-blue-600">
+                GarageGrid Pro
+              </CardTitle>
+            </div>
+            <CardDescription>
+              Welcome to GarageGrid Pro - Your smart inventory management system
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <Link href="/auth/signin" className="w-full">
+                <Button className="w-full" size="lg">
+                  Sign In
+                </Button>
+              </Link>
+              <Link href="/auth/signup" className="w-full">
+                <Button variant="outline" className="w-full" size="lg">
+                  Create Account
+                </Button>
+              </Link>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 overflow-x-hidden">
+      {/* Clean Minimal Header */}
+      <header className="bg-white border-b border-gray-200">
+        <div className="max-w-7xl mx-auto px-4 py-4">
+          <div className="flex items-center justify-between">
+            {/* Branding Section - Now with more space */}
+            <div className="flex items-center space-x-3">
+              <img 
+                src="/garagegrid-logo.png" 
+                alt="GarageGrid Logo" 
+                className="w-10 h-10 object-contain"
+              />
+              <div>
+                <h1 className="text-2xl font-bold text-black">GarageGrid Pro</h1>
+                <p className="text-sm text-gray-500 -mt-1">Smart Storage. Effortless Retrieval.</p>
+              </div>
+            </div>
+            
+            {/* Right side - Refresh and logout buttons */}
+            {session && (
+              <TooltipProvider>
+                <div className="flex items-center space-x-2">
+                  {/* Refresh Button */}
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleForceRefresh}
+                        disabled={isRefreshing}
+                        className="flex items-center space-x-2 hover:bg-blue-50 border-gray-200"
+                      >
+                        <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
+                        <span className="hidden sm:inline">
+                          {isRefreshing ? 'Refreshing...' : 'Refresh'}
+                        </span>
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p>Force refresh all data (Ctrl+R)</p>
+                    </TooltipContent>
+                  </Tooltip>
+                  
+                  {/* Logout Button */}
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => signOut({ callbackUrl: '/' })}
+                        className="flex items-center space-x-2 hover:bg-red-50 border-gray-200"
+                      >
+                        <LogOut className="h-4 w-4" />
+                        <span className="hidden sm:inline">Sign Out</span>
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p>Sign Out</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
+              </TooltipProvider>
+            )}
+          </div>
+        </div>
+      </header>
+
+        {/* Main Content */}
+        <main className="px-4 sm:px-6 py-4 max-w-7xl mx-auto w-full">
+
+        {/* Select Room Section */}
+        <div className="mb-8">
+          <h3 className="text-2xl font-bold text-black mb-2 text-center">
+            Select a Room to Enter
+          </h3>
+          {/* Conditional messaging - only show tip when no rooms exist */}
+          {!loading && rooms.length === 0 && (
+            <p className="text-gray-500 text-center mb-6">
+              + Add New Room to get started
+            </p>
+          )}
+
+          {loading ? (
+            <div className="flex items-center justify-center py-16">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+            </div>
+          ) : rooms.length === 0 ? (
+            /* Empty State - Show only the Add Room card, centered */
+            <div className="flex justify-center">
+              <div className="w-full max-w-sm">
+                <Card 
+                  className="bg-white border-2 border-dashed border-gray-300 hover:border-blue-400 transition-all duration-200 hover:shadow-lg cursor-pointer h-40 flex flex-col"
+                  onClick={() => setIsRoomFormOpen(true)}
+                >
+                  <CardContent className="flex flex-col items-center justify-center flex-1 text-center p-4">
+                    <div className="w-12 h-12 bg-blue-50 rounded-full flex items-center justify-center mb-3 border border-blue-200">
+                      <Plus className="h-6 w-6 text-blue-500" />
+                    </div>
+                    <h3 className="text-lg font-bold text-black mb-1">Add New Room</h3>
+                    <p className="text-gray-500 text-sm">
+                      Create your first storage area
+                    </p>
+                  </CardContent>
+                </Card>
+              </div>
+            </div>
+          ) : (
+            /* Two-Column Layout: Rooms + Activity Feed */
+            <div className="w-full max-w-7xl mx-auto">
+              <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+                {/* Rooms Grid (Takes up 2/3 on xl screens) */}
+                <div className="xl:col-span-2">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                {rooms.map((room, index) => {
+                  // Define border colors to cycle through
+                  const borderColors = [
+                    'border-teal-400 bg-teal-50',      // Teal for first room
+                    'border-rose-400 bg-rose-50',      // Rose for second room  
+                    'border-blue-400 bg-blue-50',      // Blue for third room
+                    'border-orange-400 bg-orange-50',  // Orange for fourth room
+                    'border-red-400 bg-red-50',        // Red for fifth room
+                    'border-purple-400 bg-purple-50'   // Purple for sixth room
+                  ];
+                  
+                  const colorClasses = borderColors[index % borderColors.length];
+                  const itemCount = room._count?.items || 0;
+                  
+                  return (
+                    <Card 
+                      key={room.id}
+                      className={`${colorClasses} border-2 transition-all duration-200 hover:shadow-lg`}
+                    >
+                      <CardContent className="p-6">
+                        {/* Status Badge */}
+                        <div className="flex justify-between items-start mb-4">
+                          <Badge 
+                            variant="outline" 
+                            className={`${
+                              itemCount > 0 
+                                ? 'bg-green-100 text-green-800 border-green-300' 
+                                : 'bg-gray-100 text-gray-600 border-gray-300'
+                            }`}
+                          >
+                            {itemCount > 0 ? 'Active' : 'Empty'}
+                          </Badge>
+                          
+                          {/* Menu Button */}
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button 
+                                variant="ghost" 
+                                size="sm" 
+                                className="h-8 w-8 p-0"
+                              >
+                                <MoreVertical className="h-4 w-4" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end">
+                              <DropdownMenuItem onClick={() => handleEditRoom(room)}>
+                                <Edit className="mr-2 h-4 w-4" />
+                                Edit Room
+                              </DropdownMenuItem>
+                              <DropdownMenuItem 
+                                onClick={() => handleRoomDelete(room)}
+                                className="text-red-600 focus:text-red-600"
+                              >
+                                <Trash2 className="mr-2 h-4 w-4" />
+                                Delete Room
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </div>
+
+                        {/* Room Name */}
+                        <h2 className="text-2xl font-bold text-gray-900 mb-2">
+                          {room.name}
+                        </h2>
+                        
+                        {/* Description */}
+                        <p className="text-gray-600 text-base mb-4">
+                          {room.description || 'No description'}
+                        </p>
+                        
+                        {/* Item Count */}
+                        <div className="flex items-center justify-between mb-6">
+                          <div className="flex items-center text-gray-500">
+                            <Package className="h-5 w-5 mr-2" />
+                            <span>{itemCount} items</span>
+                          </div>
+                          <Badge variant="secondary" className="bg-white/60">
+                            {new Date(room.createdAt).toLocaleDateString()}
+                          </Badge>
+                        </div>
+                        
+                        {/* Enter Room Button */}
+                        <Link href={`/rooms/${room.id}`} className="block">
+                          <Button 
+                            className="w-full bg-blue-600 hover:bg-blue-700 text-white"
+                            size="lg"
+                          >
+                            <Eye className="h-4 w-4 mr-2" />
+                            Enter Room
+                          </Button>
+                        </Link>
+                      </CardContent>
+                    </Card>
+                  );
+                })}
+                
+                {/* Add New Room Card */}
+                <Card 
+                  className="bg-white border-2 border-dashed border-gray-300 hover:border-blue-400 transition-all duration-200 hover:shadow-lg cursor-pointer min-h-[280px]"
+                  onClick={() => setIsRoomFormOpen(true)}
+                >
+                  <CardContent className="flex flex-col items-center justify-center h-full text-center p-6">
+                    <div className="w-16 h-16 bg-blue-50 rounded-full flex items-center justify-center mb-4 border border-blue-200">
+                      <Plus className="h-8 w-8 text-blue-500" />
+                    </div>
+                    <h3 className="text-xl font-bold text-black mb-2">Add New Room</h3>
+                    <p className="text-gray-500">
+                      Create a new storage area
+                    </p>
+                  </CardContent>
+                </Card>
+              </div>
+                
+                {/* Activity Feed Sidebar - Only shows on xl screens */}
+                <div className="xl:col-span-1">
+                  <ActivityFeed />
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Quick Actions Section */}
+        {session && (
+          <div className="mb-8">
+            <div className="flex items-center justify-center mb-6">
+              <h3 className="text-xl font-semibold text-black">Quick Actions</h3>
+            </div>
+            
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-4">
+              {quickActions.slice(0, 6).map((action: any) => {
+                const IconComponent = action.icon
+                const colorClasses = {
+                  green: 'bg-green-50 border-green-200 hover:bg-green-100 hover:border-green-300',
+                  red: 'bg-red-50 border-red-200 hover:bg-red-100 hover:border-red-300',
+                  orange: 'bg-orange-50 border-orange-200 hover:bg-orange-100 hover:border-orange-300',
+                  blue: 'bg-blue-50 border-blue-200 hover:bg-blue-100 hover:border-blue-300',
+                  gray: 'bg-gray-50 border-gray-200 hover:bg-gray-100 hover:border-gray-300',
+                  amber: 'bg-amber-50 border-amber-200 hover:bg-amber-100 hover:border-amber-300',
+                  purple: 'bg-purple-50 border-purple-200 hover:bg-purple-100 hover:border-purple-300',
+                  emerald: 'bg-emerald-50 border-emerald-200 hover:bg-emerald-100 hover:border-emerald-300'
+                }
+
+                const iconColorClasses = {
+                  green: 'text-green-600',
+                  red: 'text-red-600',
+                  orange: 'text-orange-600',
+                  blue: 'text-blue-600',
+                  gray: 'text-gray-600',
+                  amber: 'text-amber-600',
+                  purple: 'text-purple-600',
+                  emerald: 'text-emerald-600'
+                }
+
+                return (
+                  <Card
+                    key={action.id}
+                    className={`cursor-pointer transition-all duration-200 hover:shadow-md border-2 ${colorClasses[action.color as keyof typeof colorClasses] || colorClasses.gray}`}
+                    onClick={() => handleSearchNavigation(action, 'action')}
+                  >
+                    <CardContent className="flex flex-col items-center justify-center p-4 text-center h-20">
+                      <div className="flex items-center justify-center mb-2">
+                        <IconComponent className={`h-5 w-5 ${iconColorClasses[action.color as keyof typeof iconColorClasses] || iconColorClasses.gray}`} />
+                      </div>
+                      <span className="text-xs font-medium text-gray-700 leading-tight">{action.name}</span>
+                    </CardContent>
+                  </Card>
+                )
+              })}
+            </div>
+
+            {/* Admin Quick Actions - Collapsible */}
+            <AdminQuickActionsCollapsible className="mt-8" />
+          </div>
+        )}
+
+        {/* Shared Room Creation Dialog */}
+        <Dialog open={isRoomFormOpen} onOpenChange={setIsRoomFormOpen}>
+          <DialogContent className="max-w-md mx-2 sm:mx-4 max-h-[90vh] sm:max-h-[85vh] overflow-y-auto p-0">
+            <div className="relative">
+              {/* Enhanced Close Button for Mobile */}
+              <button
+                onClick={() => setIsRoomFormOpen(false)}
+                className="absolute right-4 top-4 z-10 p-2 rounded-full bg-white shadow-md hover:bg-gray-50 transition-colors"
+                type="button"
+              >
+                <svg className="h-5 w-5 text-gray-400" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+                </svg>
+              </button>
+              
+              {/* Form Content */}
+              <div className="p-6">
+                <RoomForm
+                  room={editingRoom as any}
+                  onSubmit={editingRoom ? handleUpdateRoom : handleCreateRoom}
+                  onCancel={handleCancelRoomForm}
+                  isLoading={isSubmittingRoom}
+                />
+              </div>
+            </div>
+          </DialogContent>
+        </Dialog>
+      </main>
+
+      {/* Quick Access Overlay */}
+      {isQuickAccessOpen && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-lg shadow-2xl max-w-4xl w-full max-h-[90vh] overflow-y-auto">
+            {/* Header */}
+            <div className="flex items-center justify-between p-6 border-b border-gray-200">
+              <div className="flex items-center space-x-3">
+                <div className="w-8 h-8 bg-blue-100 rounded-lg flex items-center justify-center">
+                  <Search className="h-5 w-5 text-blue-600" />
+                </div>
+                <div>
+                  <h2 className="text-xl font-semibold text-gray-900">Universal Search</h2>
+                  <p className="text-sm text-gray-500">Search rooms, items, and quick actions</p>
+                </div>
+              </div>
+              <div className="flex items-center space-x-2">
+                <div className="hidden sm:flex items-center space-x-1 text-xs text-gray-400">
+                  <span>Press</span>
+                  <kbd className="px-2 py-1 bg-gray-100 rounded">Esc</kbd>
+                  <span>to close</span>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setIsQuickAccessOpen(false)}
+                  className="text-gray-500 hover:text-gray-700"
+                >
+                  <X className="h-5 w-5" />
+                </Button>
+              </div>
+            </div>
+
+            {/* Content */}
+            <div className="p-6 space-y-6">
+              {/* Universal Search Bar */}
+              <div className="space-y-4">
+                <div className="relative">
+                  {isLoadingSearch ? (
+                    <Loader2 className="absolute left-3 top-3 h-4 w-4 text-blue-500 animate-spin" />
+                  ) : (
+                    <Search className="absolute left-3 top-3 h-4 w-4 text-gray-400" />
+                  )}
+                  <input
+                    type="text"
+                    placeholder="Search rooms, items, actions... (try typing 'kitchen' or 'tools')"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent text-lg"
+                    autoFocus
+                  />
+                  {searchQuery && (
+                    <div className="absolute right-3 top-3">
+                      <button
+                        onClick={() => setSearchQuery('')}
+                        className="text-gray-400 hover:text-gray-600"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* Search Controls */}
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center space-x-4">
+                    {/* Sort Dropdown */}
+                    <div className="flex items-center space-x-2">
+                      <SortAsc className="h-4 w-4 text-gray-500" />
+                      <select
+                        value={searchSortBy}
+                        onChange={(e) => setSearchSortBy(e.target.value as any)}
+                        className="text-sm border border-gray-300 rounded px-2 py-1 focus:ring-1 focus:ring-blue-500"
+                      >
+                        <option value="relevance">Relevance</option>
+                        <option value="alphabetical">A-Z</option>
+                        <option value="recency">Recent</option>
+                      </select>
+                    </div>
+
+                    {/* Room Status Filter */}
+                    <div className="flex items-center space-x-2">
+                      <Filter className="h-4 w-4 text-gray-500" />
+                      <select
+                        value={searchFilters.roomStatus}
+                        onChange={(e) => setSearchFilters(prev => ({ ...prev, roomStatus: e.target.value }))}
+                        className="text-sm border border-gray-300 rounded px-2 py-1 focus:ring-1 focus:ring-blue-500"
+                      >
+                        <option value="all">All Rooms</option>
+                        <option value="active">Active Rooms</option>
+                        <option value="low">Light Use</option>
+                        <option value="empty">Empty Rooms</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Search History */}
+                  {searchHistory.length > 0 && !searchQuery && (
+                    <div className="flex items-center space-x-2">
+                      <History className="h-4 w-4 text-gray-500" />
+                      <div className="flex space-x-1">
+                        {searchHistory.slice(0, 3).map((query, index) => (
+                          <button
+                            key={index}
+                            onClick={() => setSearchQuery(query)}
+                            className="text-xs bg-gray-100 hover:bg-gray-200 px-2 py-1 rounded transition-colors"
+                          >
+                            {query}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Keyboard Hints */}
+                <div className="hidden sm:flex items-center justify-center space-x-4 text-xs text-gray-400 border-t border-gray-100 pt-3">
+                  <div className="flex items-center space-x-1">
+                    <kbd className="px-2 py-1 bg-gray-100 rounded">↑↓</kbd>
+                    <span>Navigate</span>
+                  </div>
+                  <div className="flex items-center space-x-1">
+                    <kbd className="px-2 py-1 bg-gray-100 rounded">↵</kbd>
+                    <span>Select</span>
+                  </div>
+                  <div className="flex items-center space-x-1">
+                    <kbd className="px-2 py-1 bg-gray-100 rounded">Cmd</kbd>
+                    <kbd className="px-2 py-1 bg-gray-100 rounded">K</kbd>
+                    <span>Quick Open</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Search Results or Default Content */}
+              {searchQuery.trim() ? (
+                <div className="space-y-6">
+                  {/* Search Results */}
+                  {searchResults.rooms.length > 0 && (
+                    <div>
+                      <h3 className="text-sm font-medium text-gray-500 mb-3 flex items-center">
+                        <HomeIcon className="h-4 w-4 mr-2" />
+                        Rooms ({searchResults.rooms.length})
+                      </h3>
+                      <div className="space-y-2">
+                        {searchResults.rooms.map((room, index) => {
+                          const itemCount = room._count?.items || 0
+                          const rackCount = room._count?.racks || 0
+                          const activityStyle = getRoomActivityStyle(itemCount, rackCount)
+                          const isSelected = selectedResultIndex === index
+                          
+                          return (
+                            <div
+                              key={room.id}
+                              onClick={() => handleSearchNavigation(room, 'room')}
+                              className={`flex items-center p-3 rounded-lg cursor-pointer transition-colors ${
+                                isSelected 
+                                  ? 'bg-blue-50 border border-blue-200' 
+                                  : 'hover:bg-gray-50'
+                              }`}
+                            >
+                              <div className={`w-8 h-8 rounded-lg flex items-center justify-center mr-3 ${
+                                activityStyle.level === 'active' 
+                                  ? 'bg-green-100' 
+                                  : activityStyle.level === 'low'
+                                  ? 'bg-amber-100'
+                                  : 'bg-gray-100'
+                              }`}>
+                                <div className={`w-4 h-4 rounded ${
+                                  activityStyle.level === 'active' 
+                                    ? 'bg-green-500' 
+                                    : activityStyle.level === 'low'
+                                    ? 'bg-amber-500'
+                                    : 'bg-gray-400'
+                                }`}></div>
+                              </div>
+                              <div className="flex-1">
+                                <div className="flex items-center justify-between">
+                                  <p className="font-medium text-gray-900">{room.name}</p>
+                                  <div className="flex items-center space-x-2">
+                                    <span className={`text-xs px-2 py-1 rounded-full ${
+                                      activityStyle.level === 'active' 
+                                        ? 'bg-green-100 text-green-800' 
+                                        : activityStyle.level === 'low'
+                                        ? 'bg-amber-100 text-amber-800'
+                                        : 'bg-gray-100 text-gray-600'
+                                    }`}>
+                                      {itemCount} item{itemCount !== 1 ? 's' : ''}
+                                    </span>
+                                    {isSelected && <ArrowRight className="h-4 w-4 text-blue-500" />}
+                                  </div>
+                                </div>
+                                {room.description && (
+                                  <p className="text-sm text-gray-500 truncate text-center">
+                                    {room.description}
+                                  </p>
+                                )}
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Items Results */}
+                  {searchResults.items.length > 0 && (
+                    <div>
+                      <h3 className="text-sm font-medium text-gray-500 mb-3 flex items-center">
+                        <Package className="h-4 w-4 mr-2" />
+                        Items ({searchResults.items.length})
+                      </h3>
+                      <div className="space-y-2">
+                        {searchResults.items.map((item, index) => {
+                          const globalIndex = searchResults.rooms.length + index
+                          const isSelected = selectedResultIndex === globalIndex
+                          
+                          return (
+                            <div
+                              key={item.id}
+                              onClick={() => handleSearchNavigation(item, 'item')}
+                              className={`flex items-center p-3 rounded-lg cursor-pointer transition-colors ${
+                                isSelected 
+                                  ? 'bg-blue-50 border border-blue-200' 
+                                  : 'hover:bg-gray-50'
+                              }`}
+                            >
+                              <div className="w-8 h-8 rounded-lg bg-blue-100 flex items-center justify-center mr-3">
+                                <Package className="h-4 w-4 text-blue-600" />
+                              </div>
+                              <div className="flex-1">
+                                <div className="flex items-center justify-between">
+                                  <div>
+                                    <p className="font-medium text-gray-900">{item.name}</p>
+                                    <p className="text-xs text-gray-500">
+                                      in {item.room?.name || 'Unknown Room'}
+                                      {item.category && (
+                                        <span className="ml-2 px-2 py-1 bg-gray-100 text-gray-600 rounded text-xs">
+                                          {item.category}
+                                        </span>
+                                      )}
+                                    </p>
+                                  </div>
+                                  <div className="flex items-center space-x-2">
+                                    {item.quantity && (
+                                      <span className="text-xs text-gray-500">
+                                        Qty: {item.quantity}
+                                      </span>
+                                    )}
+                                    {isSelected && <ArrowRight className="h-4 w-4 text-blue-500" />}
+                                  </div>
+                                </div>
+                                {item.description && (
+                                  <p className="text-sm text-gray-500 truncate mt-1">
+                                    {item.description}
+                                  </p>
+                                )}
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Actions Results */}
+                  {searchResults.actions.length > 0 && (
+                    <div>
+                      <h3 className="text-sm font-medium text-gray-500 mb-3 flex items-center">
+                        <Zap className="h-4 w-4 mr-2" />
+                        Quick Actions ({searchResults.actions.length})
+                      </h3>
+                      <div className="space-y-2">
+                        {searchResults.actions.map((action, index) => {
+                          const globalIndex = searchResults.rooms.length + searchResults.items.length + index
+                          const isSelected = selectedResultIndex === globalIndex
+                          const IconComponent = action.icon
+                          const colorClasses = {
+                            green: 'bg-green-100 text-green-600',
+                            red: 'bg-red-100 text-red-600',
+                            orange: 'bg-orange-100 text-orange-600',
+                            blue: 'bg-blue-100 text-blue-600',
+                            gray: 'bg-gray-100 text-gray-600',
+                            amber: 'bg-amber-100 text-amber-600'
+                          }
+                          
+                          return (
+                            <div
+                              key={action.id}
+                              onClick={() => handleSearchNavigation(action, 'action')}
+                              className={`flex items-center p-3 rounded-lg cursor-pointer transition-colors ${
+                                isSelected 
+                                  ? 'bg-blue-50 border border-blue-200' 
+                                  : 'hover:bg-gray-50'
+                              }`}
+                            >
+                              <div className={`w-8 h-8 rounded-lg flex items-center justify-center mr-3 ${colorClasses[action.color as keyof typeof colorClasses] || colorClasses.gray}`}>
+                                <IconComponent className="h-4 w-4" />
+                              </div>
+                              <div className="flex-1">
+                                <div className="flex items-center justify-between">
+                                  <div>
+                                    <p className="font-medium text-gray-900">{action.name}</p>
+                                    <p className="text-sm text-gray-500">{action.description}</p>
+                                  </div>
+                                  {isSelected && <ArrowRight className="h-4 w-4 text-blue-500" />}
+                                </div>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* No Results */}
+                  {searchResults.rooms.length === 0 && searchResults.actions.length === 0 && searchResults.items.length === 0 && (
+                    <div className="text-center py-8">
+                      <Search className="h-12 w-12 text-gray-300 mx-auto mb-4" />
+                      <p className="text-gray-500">No results found for "{searchQuery}"</p>
+                      <p className="text-sm text-gray-400 mt-1">Try searching for room names, item names, actions, or keywords</p>
+                      
+                      {/* Search suggestions */}
+                      <div className="mt-4 text-sm text-gray-400">
+                        <p>Try searching for:</p>
+                        <div className="flex justify-center space-x-2 mt-2">
+                          <button
+                            onClick={() => setSearchQuery('kitchen')}
+                            className="px-3 py-1 bg-gray-100 rounded hover:bg-gray-200 transition-colors"
+                          >
+                            kitchen
+                          </button>
+                          <button
+                            onClick={() => setSearchQuery('tools')}
+                            className="px-3 py-1 bg-gray-100 rounded hover:bg-gray-200 transition-colors"
+                          >
+                            tools
+                          </button>
+                          <button
+                            onClick={() => setSearchQuery('receipt')}
+                            className="px-3 py-1 bg-gray-100 rounded hover:bg-gray-200 transition-colors"
+                          >
+                            receipt
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="space-y-6">
+                  {/* Recent Rooms */}
+                  {recentRooms.length > 0 && (
+                    <div>
+                      <h3 className="text-sm font-medium text-gray-500 mb-3 flex items-center">
+                        <Clock className="h-4 w-4 mr-2" />
+                        Recent Rooms
+                      </h3>
+                      <div className="space-y-2">
+                        {recentRooms.slice(0, 3).map((room) => {
+                          const itemCount = room._count?.items || 0
+                          const rackCount = room._count?.racks || 0
+                          const activityStyle = getRoomActivityStyle(itemCount, rackCount)
+                          
+                          return (
+                            <div
+                              key={room.id}
+                              onClick={() => handleSearchNavigation(room, 'room')}
+                              className="flex items-center p-3 rounded-lg hover:bg-gray-50 cursor-pointer transition-colors"
+                            >
+                              <div className={`w-8 h-8 rounded-lg flex items-center justify-center mr-3 ${
+                                activityStyle.level === 'active' 
+                                  ? 'bg-green-100' 
+                                  : activityStyle.level === 'low'
+                                  ? 'bg-amber-100'
+                                  : 'bg-gray-100'
+                              }`}>
+                                <div className={`w-4 h-4 rounded ${
+                                  activityStyle.level === 'active' 
+                                    ? 'bg-green-500' 
+                                    : activityStyle.level === 'low'
+                                    ? 'bg-amber-500'
+                                    : 'bg-gray-400'
+                                }`}></div>
+                              </div>
+                              <div className="flex-1">
+                                <div className="flex items-center justify-between">
+                                  <p className="font-medium text-gray-900">{room.name}</p>
+                                  <span className={`text-xs px-2 py-1 rounded-full ${
+                                    activityStyle.level === 'active' 
+                                      ? 'bg-green-100 text-green-800' 
+                                      : activityStyle.level === 'low'
+                                      ? 'bg-amber-100 text-amber-800'
+                                      : 'bg-gray-100 text-gray-600'
+                                  }`}>
+                                    {itemCount} item{itemCount !== 1 ? 's' : ''}
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+
+                </div>
+              )}
+            </div>
+
+
+            </div>
+          </div>
+      )}
+
+      {/* Bottom Toolbar */}
+      {session && (
+        <HomeBottomToolbar 
+          onSearchOpen={() => setIsQuickAccessOpen(true)}
+          onAddRoomOpen={() => setIsRoomFormOpen(true)}
+        />
+      )}
+    </div>
+  )
+}
